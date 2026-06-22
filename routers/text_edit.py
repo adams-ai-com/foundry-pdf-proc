@@ -187,3 +187,192 @@ async def edit_text_span(job_id: str, body: dict, _=Depends(verify_secret)):
     ms = (time.monotonic() - t0) * 1000
     log.info("%s   job=%s → ok  %.0fms", action, job_id[:8], ms)
     return {"ok": True}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Paragraph (block) editing — spec: foundry-pdf-paragraph-editing.md
+# ──────────────────────────────────────────────────────────────────────────
+
+_ALIGN = {"left": 0, "center": 1, "right": 2, "justify": 3}
+
+
+def _line_text(line) -> str:
+    return "".join(span.get("text", "") for span in line.get("spans", []))
+
+
+def _split_block_into_paragraphs(lines):
+    """Split a dict-block's lines into paragraph groups on a large vertical gap
+    (or a smaller gap plus a left-indent jump). Returns a list of line-lists."""
+    lines = [ln for ln in lines if ln.get("bbox") and ln.get("spans")]
+    if not lines:
+        return []
+    heights = sorted(ln["bbox"][3] - ln["bbox"][1] for ln in lines)
+    med_h = heights[len(heights) // 2] or 12.0
+    groups = [[lines[0]]]
+    for prev, cur in zip(lines, lines[1:]):
+        gap = cur["bbox"][1] - prev["bbox"][3]
+        indent_jump = (cur["bbox"][0] - prev["bbox"][0]) > med_h
+        if gap > 1.6 * med_h or (gap > 0.4 * med_h and indent_jump):
+            groups.append([cur])
+        else:
+            groups[-1].append(cur)
+    return groups
+
+
+def _infer_align(para_lines, block_x0, block_x1):
+    if len(para_lines) < 2:
+        return "left"
+    width = (block_x1 - block_x0) or 1.0
+    tol = 0.04 * width
+    avg_left = sum(ln["bbox"][0] - block_x0 for ln in para_lines) / len(para_lines)
+    avg_right = sum(block_x1 - ln["bbox"][2] for ln in para_lines) / len(para_lines)
+    if avg_right < tol and avg_left > tol:
+        return "right"
+    if abs(avg_left - avg_right) < tol and avg_left > tol:
+        return "center"
+    body = para_lines[:-1]
+    if body and all((block_x1 - ln["bbox"][2]) < tol for ln in body):
+        return "justify"
+    return "left"
+
+
+def _summarize_para(para_lines):
+    """Flatten a paragraph's lines into editable prose + dominant style."""
+    text = " ".join(" ".join(_line_text(ln).split()) for ln in para_lines).strip()
+    x0 = min(ln["bbox"][0] for ln in para_lines)
+    y0 = min(ln["bbox"][1] for ln in para_lines)
+    x1 = max(ln["bbox"][2] for ln in para_lines)
+    y1 = max(ln["bbox"][3] for ln in para_lines)
+    fonts, sizes, colors, flags = (collections.Counter() for _ in range(4))
+    for ln in para_lines:
+        for sp in ln.get("spans", []):
+            n = len(sp.get("text", ""))
+            if not n:
+                continue
+            fonts[sp.get("font", "")] += n
+            sizes[round(float(sp.get("size", 12.0)), 1)] += n
+            colors[sp.get("color", 0)] += n
+            flags[sp.get("flags", 0)] += n
+    return {
+        "text": text,
+        "bbox": [x0, y0, x1, y1],
+        "font": fonts.most_common(1)[0][0] if fonts else "",
+        "size": sizes.most_common(1)[0][0] if sizes else 12.0,
+        "flags": flags.most_common(1)[0][0] if flags else 0,
+        "color": _unpack_color(colors.most_common(1)[0][0]) if colors else [0.0, 0.0, 0.0],
+        "align": _infer_align(para_lines, x0, x1),
+        "line_count": len(para_lines),
+    }
+
+
+def _fit_paragraph(page, rect, text, fontname, size, align):
+    """Find a (rect, size) that fits `text` via insert_textbox — grow the box
+    downward first, then shrink the font. Tested on a throwaway page so no
+    partial text lands on the real page. Returns (rect, size, fitted)."""
+    al = _ALIGN.get(align, 0)
+    page_rect = page.rect
+    scratch = pymupdf.open()
+    sp = scratch.new_page(width=page_rect.width, height=page_rect.height)
+    cur = pymupdf.Rect(rect)
+    cur_size = float(size)
+    bottom_limit = page_rect.y1 - 2
+    fitted = False
+    for _ in range(160):
+        rc = sp.insert_textbox(cur, text, fontname=fontname, fontsize=cur_size, align=al)
+        if rc >= 0:
+            fitted = True
+            break
+        if cur.y1 < bottom_limit:
+            cur = pymupdf.Rect(cur.x0, cur.y0, cur.x1,
+                               min(cur.y1 + max(cur_size, 12.0), bottom_limit))
+        elif cur_size > 6.0:
+            cur_size -= 0.5
+        else:
+            break
+    scratch.close()
+    return cur, cur_size, fitted
+
+
+@router.get("/text-blocks/{job_id}/{page_num}")
+async def get_text_blocks(job_id: str, page_num: int, _=Depends(verify_secret)):
+    """Return paragraph blocks for the paragraph-edit (¶) mode."""
+    t0 = time.monotonic()
+    doc = pymupdf.open(str(get_pdf_path(job_id)))
+    if page_num < 0 or page_num >= len(doc):
+        doc.close()
+        return {"blocks": []}
+    page = doc[page_num]
+    raw = page.get_text(
+        "dict",
+        flags=pymupdf.TEXT_PRESERVE_WHITESPACE | pymupdf.TEXT_PRESERVE_LIGATURES,
+    )
+    doc.close()
+    out = []
+    for block in raw.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for para_lines in _split_block_into_paragraphs(block.get("lines", [])):
+            summ = _summarize_para(para_lines)
+            if summ["text"]:
+                out.append(summ)
+    # PyMuPDF yields blocks in content-stream order, not visual order (and an
+    # edited paragraph re-enters the stream last). Sort top→bottom, left→right
+    # so block ids are stable and match what the user sees.
+    out.sort(key=lambda s: (round(s["bbox"][1], 1), round(s["bbox"][0], 1)))
+    for i, s in enumerate(out):
+        s["id"] = i
+    log.info("blocks job=%s page=%d → %d  %.0fms", job_id[:8], page_num, len(out),
+             (time.monotonic() - t0) * 1000)
+    return {"blocks": out}
+
+
+@router.post("/edit-paragraph/{job_id}")
+async def edit_paragraph(job_id: str, body: dict, _=Depends(verify_secret)):
+    """Replace a paragraph block: clear the old region (bg-matched) and reflow
+    the new text into it via insert_textbox (grow-then-shrink to fit)."""
+    t0 = time.monotonic()
+    page_num      = body.get("page")
+    bbox          = body.get("bbox")
+    new_text      = (body.get("new_text") or "").strip()
+    font          = str(body.get("font", ""))
+    size          = float(body.get("size", 12))
+    flags         = int(body.get("flags", 0))
+    color         = body.get("color", [0.0, 0.0, 0.0])
+    align         = body.get("align", "left")
+    resolved_font = body.get("resolved_font")
+
+    if page_num is None or not bbox:
+        raise HTTPException(400, "page and bbox required")
+
+    doc = pymupdf.open(str(get_pdf_path(job_id)))
+    if page_num < 0 or page_num >= len(doc):
+        doc.close()
+        raise HTTPException(400, "invalid page")
+    page = doc[page_num]
+    rect = pymupdf.Rect(bbox)
+    fontname = resolved_font if resolved_font else _match_font(font, flags)
+    col = tuple(float(v) for v in _unpack_color(color)[:3])
+
+    # Fit-test BEFORE any destructive change, so an overflow is non-destructive.
+    final_rect, final_size, fitted = rect, size, True
+    if new_text:
+        final_rect, final_size, fitted = _fit_paragraph(page, rect, new_text, fontname, size, align)
+        if not fitted:
+            doc.close()
+            raise HTTPException(status_code=409, detail={
+                "fit": False,
+                "message": "Text does not fit even at minimum size — shorten it or split the paragraph.",
+            })
+
+    bg = _detect_bg(page, rect)
+    page.add_redact_annot(rect + (-1, -1, 1, 1), fill=bg)
+    page.apply_redactions()
+    if new_text:
+        page.insert_textbox(final_rect, new_text, fontname=fontname,
+                            fontsize=final_size, color=col, align=_ALIGN.get(align, 0))
+
+    save_pdf(doc, job_id)
+    grew = final_rect.y1 > rect.y1 + 0.5
+    log.info("para   job=%s page=%s grew=%s size=%.1f  %.0fms", job_id[:8], page_num,
+             grew, final_size, (time.monotonic() - t0) * 1000)
+    return {"ok": True, "grew": grew, "size": final_size}
