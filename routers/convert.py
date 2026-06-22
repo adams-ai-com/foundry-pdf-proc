@@ -23,13 +23,27 @@ EXPORT_MIME = {
     "pdfa": "application/pdf",
 }
 
+# A PDF opens in Draw by default, which has no Writer/Calc/Impress export filter
+# (→ "no export filter for X.docx found"). Force the matching import filter so
+# the PDF loads into the right application before we export it.
+PDF_IMPORT_FILTER = {
+    "docx": "writer_pdf_import",
+    "xlsx": "calc_pdf_import",
+    "pptx": "impress_pdf_import",
+}
+
 
 def _run_lo(args: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
-    """Run LibreOffice with an isolated user profile to avoid lock conflicts."""
+    """Run LibreOffice with an isolated user profile to avoid lock conflicts.
+
+    Note: the bootstrap variable is `-env:` (single dash). LibreOffice 24.2+
+    rejects the double-dash `--env:` form with "Error in option", which fails
+    the whole conversion.
+    """
     with tempfile.TemporaryDirectory() as profile_dir:
         result = subprocess.run(
             ["libreoffice", "--headless",
-             f"--env:UserInstallation=file://{profile_dir}",
+             f"-env:UserInstallation=file://{profile_dir}",
              *args],
             capture_output=True, timeout=timeout,
         )
@@ -110,7 +124,11 @@ async def export_file(job_id: str, format: str = Query(...)):
     # docx / xlsx / pptx via LibreOffice
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
-        result = _run_lo(["--convert-to", format, "--outdir", str(tmpdir), str(pdf_path)], timeout=180)
+        lo_args = ["--convert-to", format, "--outdir", str(tmpdir), str(pdf_path)]
+        infilter = PDF_IMPORT_FILTER.get(format)
+        if infilter:
+            lo_args = [f"--infilter={infilter}", *lo_args]
+        result = _run_lo(lo_args, timeout=180)
         if result.returncode != 0:
             raise HTTPException(500, f"Conversion failed: {result.stderr.decode()[:500]}")
         out_files = list(tmpdir.glob(f"*.{format}"))
