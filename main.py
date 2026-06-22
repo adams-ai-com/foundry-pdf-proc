@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from deps import verify_secret, STORE, read_limited, MAX_PDF_BYTES
 from routers import (render, pages, annotate, forms, convert, redact, undo, search,
-                     protect, watermark, text, comments,
+                     protect, watermark, text, text_edit, comments,
                      image, props, bookmarks, header_footer, crop, replace, annots, links, ocr, fields, compare, sign,
                      envelope_sign, template)
 
@@ -40,6 +40,7 @@ app.include_router(search.router)
 app.include_router(protect.router)
 app.include_router(watermark.router)
 app.include_router(text.router)
+app.include_router(text_edit.router)
 app.include_router(comments.router)
 app.include_router(image.router)
 app.include_router(props.router)
