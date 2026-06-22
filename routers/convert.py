@@ -1,3 +1,4 @@
+import logging
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +13,7 @@ from fastapi.responses import Response
 from deps import STORE, get_pdf_path, verify_secret, read_limited, MAX_PDF_BYTES
 
 router = APIRouter()
+log    = logging.getLogger("convert")
 
 IMPORT_EXTS = {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".doc", ".xls", ".ppt"}
 
@@ -121,7 +123,42 @@ async def export_file(job_id: str, format: str = Query(...)):
         return Response(data, media_type=mime,
                         headers={"Content-Disposition": f'attachment; filename="{job_id}_pages.zip"'})
 
-    # docx / xlsx / pptx via LibreOffice
+    if format == "docx":
+        # Primary: pdf2docx — purpose-built, clean editable paragraphs/tables,
+        # no duplication. Fallback: LibreOffice writer_pdf_import (robustness
+        # for PDFs pdf2docx can't parse, e.g. heavily malformed ones).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            out = tmpdir / "out.docx"
+            try:
+                from pdf2docx import Converter
+                cv = Converter(str(pdf_path))
+                try:
+                    cv.convert(str(out))
+                finally:
+                    cv.close()
+                if not out.exists() or out.stat().st_size == 0:
+                    raise RuntimeError("pdf2docx produced no output")
+                data = out.read_bytes()
+            except Exception as exc:
+                log.warning("docx job=%s pdf2docx failed (%s) — falling back to LibreOffice",
+                            job_id[:8], exc)
+                lo_out = tmpdir / "lo"
+                lo_out.mkdir(exist_ok=True)
+                result = _run_lo(
+                    [f"--infilter={PDF_IMPORT_FILTER['docx']}",
+                     "--convert-to", "docx", "--outdir", str(lo_out), str(pdf_path)],
+                    timeout=180,
+                )
+                lo_files = list(lo_out.glob("*.docx"))
+                if result.returncode != 0 or not lo_files:
+                    detail = result.stderr.decode()[:300] if result.returncode != 0 else "no output"
+                    raise HTTPException(500, f"Word conversion failed: {detail}")
+                data = lo_files[0].read_bytes()
+        return Response(data, media_type=mime,
+                        headers={"Content-Disposition": f'attachment; filename="{job_id}.docx"'})
+
+    # xlsx / pptx via LibreOffice
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
         lo_args = ["--convert-to", format, "--outdir", str(tmpdir), str(pdf_path)]
