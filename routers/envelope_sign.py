@@ -24,7 +24,7 @@ import pymupdf
 from deps import verify_secret, STORE
 
 ENVELOPE_STORE = Path(os.environ.get("FOUNDRY_PDF_ENVELOPE_STORE",
-                                     "/var/www/foundry-pdf-proc/envelopes"))
+                                     "data/envelopes"))
 
 # Per-envelope write lock so concurrent requests don't corrupt pyhanko signatures
 _envelope_locks: dict[str, threading.Lock] = {}
